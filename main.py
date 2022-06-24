@@ -9,11 +9,12 @@ import os
 from torchvision import datasets
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
+# from utils import convert_models_to_fp32
 
-N_epoch = 25
+iteration = 10000
 M1 = 16
 M2 = 16
-
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # creating learnable parameters for prompt
 def ParamGenerator(model, classnames, M1, M2):
@@ -82,8 +83,9 @@ class TextEncoder(nn.Module):
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
+        print(tokenized_prompts.argmax(dim=-1))
+        print(tokenized_prompts)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
         return x
 
 #custom clip for training learnable prompts
@@ -97,12 +99,12 @@ class CustomCLIP(nn.Module):
 
     def forward(self, image, prompts, tokenized_prompts):
         image_features = self.image_encoder(image.type(self.dtype))
-
         tokenized_prompts = torch.cat([tokenized_prompts, tokenized_prompts], dim=0)
         text_features = self.text_encoder(prompts, tokenized_prompts)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
         return logits.softmax(dim=-1)
@@ -125,69 +127,78 @@ def target_text(target_path):
 
 def train(source_path, target_path, batch_size, classnames, clip_model, custom_clip, preprocess):
     ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors = ParamGenerator(clip_model, classnames, M1, M2)
-    optimizer = torch.optim.Adam([ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors], lr=0.003)
-    scheduler = CosineAnnealingLR(optimizer, T_max=N_epoch)
+    optimizer = torch.optim.SGD([ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors], lr=0.003)
+    scheduler = CosineAnnealingLR(optimizer, T_max=iteration)
 
     source_loader, target_loader = load_train(source_path, target_path, batch_size, preprocess)
-
+    source_iter = iter(source_loader)
+    target_iter = iter(target_loader)
     text = target_text(target_path)
-    for epoch in range(N_epoch):
-        source_loss = 0
-        target_loss = 0
-        tot_acc = 0
-        source_len = 0
-        target_len = 0
-        for i, (data, label) in enumerate(source_loader):
-            data = data.to(device)
-            label = label.to(device)
+    for i in range(iteration):
+        try:
+            source_data, source_label = source_iter.next()
+        except Exception as err:
+            source_iter = iter(source_loader)
+            source_data, source_label = source_iter.next()
 
-            prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors)
+        try:
+            target_data, target_label = target_iter.next()
+        except Exception as err:
+            target_iter = iter(target_loader)
+            target_data, target_label = target_iter.next()
 
-            optimizer.zero_grad()
-            output = custom_clip(data, prompts, tokenized_prompts)
-            loss = F.cross_entropy(output, label)
-            loss.backward()
-            optimizer.step()
+        source_data = source_data.to(device)
+        source_label = source_label.to(device)
+        target_data = target_data.to(device)
+
+        prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors)
+
+        optimizer.zero_grad()
+        source_output = custom_clip(source_data, prompts, tokenized_prompts)
+        source_loss = F.cross_entropy(source_output, source_label)
+
+        target_token = clip.tokenize(text).to(device)
+        logits_per_image, logits_per_text = clip_model(target_data, target_token)
+        pseudo_label = torch.argmax(logits_per_image.softmax(dim=-1), dim=1)  # target class pseudo labels
+        pseudo_label += 65
+        target_output = custom_clip(target_data, prompts, tokenized_prompts)
+        target_loss = F.cross_entropy(target_output, pseudo_label)
+
+        loss = source_loss + target_loss
+        loss.backward()
+        optimizer.step()
+
+        if i % 50 == 0:
             scheduler.step()
+            print("loss is " + str(loss))
 
-            source_loss += loss
-            tot_acc += (output.argmax(1) == label).sum().item()
-            source_len += 1
-
-        print("source loss is " + str(source_loss/source_len))
-        for i, (data, label) in enumerate(target_loader):
-            data = data.to(device)
-            label = label.to(device)
-            label += 65 #target class labels
-
-            target_token = clip.tokenize(text).to(device)
-            logits_per_image, logits_per_text = model(data, target_token)
-            pseudo_label = torch.argmax(logits_per_image.softmax(dim=-1),dim=1) #target class pseudo labels
-
-            prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors)
-
-            optimizer.zero_grad()
-            output = custom_clip(data, prompts, tokenized_prompts)
-            loss = F.cross_entropy(output, pseudo_label)
-            loss.backward()
-            optimizer.step()
-            target_loss += loss
-            tot_acc += (output.argmax(1) == label).sum().item()
-            target_len += 1
-        print("target loss is " + str(target_loss/target_len))
     return ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors
 
 
+def test(prompts, target_path, preprocess):
+    _, target_loader = load_train(source_path, target_path, 32, preprocess)
+    tot_acc = 0
+
+    with torch.no_grad():
+        for target_data, target_label in target_loader:
+            target_data = target_data.to(device)
+            target_label = target_label.to(device)
+
+            target_label += 65
+            output = custom_clip(target_data, prompts, tokenized_prompts)
+            tot_acc += (output.argmax(1) == target_label).sum().item()
+    print("accuracy is " + str(tot_acc / 1989))
 
 if __name__ == '__main__':
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("RN101", device=device)
+    # convert_models_to_fp32(model)
+    # model.eval()
 
     source_name = 'Art'
     target_name = 'Clipart'
 
-    source_root_path = r'D:/学习/课题1/OfficeHome/'
-    target_root_path = r'D:/学习/课题1/OfficeHome_target/'
+    source_root_path = r'/share/test/hrchen/OfficeHomeDataset/'
+    target_root_path = r'/share/test/hrchen/OfficeHomeDataset/'
 
     source_path = source_root_path + source_name
     target_path = target_root_path + target_name
@@ -195,8 +206,11 @@ if __name__ == '__main__':
     classnames = os.listdir(source_path)
 
     custom_clip = CustomCLIP(model)
-    train(source_path, target_path, 16, classnames, model, custom_clip, preprocess)
-
+    ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors = train(source_path, target_path, 16, classnames, model,
+                                                                    custom_clip, preprocess)
+    prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors,
+                                                 ctx_target_vectors)
+    test(prompts, target_path, preprocess)
 
 
 
