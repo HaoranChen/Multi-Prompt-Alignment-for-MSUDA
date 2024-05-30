@@ -1,217 +1,171 @@
 """
 Author: Haoran Chen
-Date: 2022.06.10
+Date: 2022.08.15
 """
+import argparse
 import torch
-from torch import nn
-import clip
+from clip import clip
 import os
-from torchvision import datasets
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import CosineAnnealingLR
-# from utils import convert_models_to_fp32
+from torch import nn
+from model import Custom_Clip, PromptGenerator
+from train_prompt import train_Prompt
+from train_msf import train_MSF
+from dataloader import load_pseudo_label_data, load_data
+import numpy as np
 
-iteration = 10000
-M1 = 16
-M2 = 16
-device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(1)
+np.random.seed(1)
+torch.cuda.manual_seed(1)
+torch.cuda.manual_seed_all(1)
+torch.backends.cudnn.deterministic = True
 
-# creating learnable parameters for prompt
-def ParamGenerator(model, classnames, M1, M2):
+def arg_parse():
+    parser = argparse.ArgumentParser('Training and Evaluation Script', add_help=False)
+
+    # for config
+    parser.add_argument('--file_root', type=str, default=r'/vhome/chenhaoran/hrchen/MPA/',
+                        help='model output path')
+    parser.add_argument('--data_root', type=str, default=r'/share/test/hrchen/', help='data file path')
+    parser.add_argument('--backbone', type=str, default='RN101', help='')
+    parser.add_argument('--dataset', type=str, default='ImageCLEF', help='')
+    parser.add_argument('--device', type=str, default='cuda', help='')
+
+
+    # for dataloader
+    parser.add_argument('--batch_size', type=int, default=32, help='')
+    parser.add_argument('--num_workers', type=int, default=8, help='')
+    parser.add_argument('--pin_memory', type=bool, default=True, help='')
+    parser.add_argument('--threshold', type=float, default=0.4, help='threshold tau for generating pseudo labels')
+
+    # for prompt settings
+    parser.add_argument('--M1', type=int, default=12, help='number of classification tokens')
+    parser.add_argument('--M2', type=int, default=12, help='number of domain tokens')
+
+    # for encoder settings
+    parser.add_argument('--mid_dim', type=int, default=384, help='dimension for the first feed forward layer')
+    parser.add_argument('--out_dim', type=int, default=250, help='dimension for the intrinsic subspace')
+
+    # for training settings
+    parser.add_argument('--prompt_iteration', type=int, default=5000, help='')
+    parser.add_argument('--msf_iteration', type=int, default=5000, help='')
+    parser.add_argument('--prompt_learning_rate', type=float, default=0.01, help='')
+    parser.add_argument('--prompt_momentum', type=float, default=0.9, help='')
+    parser.add_argument('--prompt_weight_decay', type=float, default=0.0001, help='')
+    parser.add_argument('--msf_learning_rate', type=float, default=0.001, help='')
+    parser.add_argument('--msf_alpha', type=int, default=500, help='')
+    parser.add_argument('--output_folder', type=str, default='', help='')
+    parser.add_argument('--n_cls', type=int, default=0, help='number of classes in dataset')
+
+
+    return parser
+
+
+def args_update(args):
+    if args.dataset == 'ImageCLEF':
+        args.backbone = 'RN50'
+        args.out_dim = 150
+        args.prompt_iteration = 400
+        args.msf_iteration = 250
+
+    if args.dataset == 'DomainNet':
+        args.backbone = 'RN101'
+        args.prompt_iteration = 4000
+        args.msf_iteration = 2000
+        args.out_dim = 300
+
+    if args.dataset == 'OfficeHome':
+        args.backbone = 'RN50'
+        args.out_dim = 150
+        args.prompt_iteration = 1000
+        args.msf_iteration = 500
+
+
+def train(domain_list, classnames, clip_model, preprocess, args):
+    custom_clip_model = Custom_Clip(clip_model)
+    custom_clip_model = nn.DataParallel(custom_clip_model)
+    custom_clip_model = custom_clip_model.module
+
+    for name, param in custom_clip_model.named_parameters():
+        param.requires_grad_(False)
+
+    for target_name in domain_list:
+        source_name_list = domain_list.copy()
+        source_name_list.remove(target_name)
+
+        if not os.path.exists(os.path.join(args.output_folder, target_name)):
+            os.makedirs(os.path.join(args.output_folder, target_name))
+
+        target_path = os.path.join(args.data_root, args.dataset, target_name)
+        target_train_loader = load_pseudo_label_data(target_name, target_path, preprocess, clip_model, args)
+        target_test_loader = load_data(target_path, preprocess, args)
+
+        prompt_name = []
+        for source_name in domain_list:
+            if source_name != target_name:
+                name = source_name + '2' + target_name + '.pkl'
+                prompt_name.append(name)
+
+                if os.path.exists(args.output_folder + '/' + target_name + '/' + name):
+                    continue
+
+                source_path = os.path.join(args.data_root, args.dataset, source_name)
+                source_train_loader = load_data(source_path, preprocess, args)
+                
+                print("Start training {} to {} prompt".format(source_name, target_name))
+                train_Prompt(target_train_loader, target_test_loader, source_train_loader, classnames, clip_model, 
+                                custom_clip_model, source_name, target_name, args)
+                print("===========================================================================================")
+        
+        prompt_cls_list = []
+        prompt_domain_list = []
+        
+        for i in range(len(prompt_name)):
+            name = prompt_name[i]
+            source_name = source_name_list[i]
+          
+            prompt_learner = PromptGenerator(classnames, clip_model, source_name, target_name, args)
+            prompt_learner.load_state_dict(torch.load(args.output_folder + '/' + target_name + '/' + name))
+
+            ctx_cls = prompt_learner.ctx_cls.float()
+            ctx_source = prompt_learner.ctx_source.float()
+            ctx_target = prompt_learner.ctx_target.float()
+            prompt_cls_list.append(ctx_cls)
+            prompt_domain_list.append(ctx_target)
+
+        print("Start aligning {} prompts".format(target_name))
+        train_MSF(target_name, target_train_loader, target_test_loader, prompt_cls_list, prompt_domain_list, custom_clip_model, clip_model, classnames, args)
+        print("===========================================================================================")
+
+
+def main(args):
+    args_update(args)
+
+    model_path = args.file_root + args.backbone + '.pt'
+    model, preprocess = clip.load(args.backbone, device=args.device, model_path=model_path)
+
+    domain_list = os.listdir(args.data_root + args.dataset)
+    domain_list = [x for x in domain_list if '.txt' not in x]
+
+    classnames_path = os.path.join(args.data_root, args.dataset, domain_list[0])
+    classnames = os.listdir(classnames_path)
     n_cls = len(classnames)
-    dtype = model.dtype
-    embedding_dim = model.ln_final.weight.shape[0]
+    classnames.sort()
 
-    ctx_cls_vectors = torch.empty(n_cls, M1, embedding_dim, requires_grad=True, dtype=dtype, device=device)
-    ctx_source_vectors = torch.empty(1, M2, embedding_dim, requires_grad=True, dtype=dtype, device=device)
-    ctx_target_vectors = torch.empty(1, M2, embedding_dim, requires_grad=True, dtype=dtype, device=device)
+    args.output_folder = os.path.join(args.file_root, args.dataset, args.backbone, 'MPA_FINAL')
 
-    nn.init.normal_(ctx_cls_vectors, std=0.02)
-    nn.init.normal_(ctx_source_vectors, std=0.02)
-    nn.init.normal_(ctx_target_vectors, std=0.02)
+    if not os.path.exists(args.output_folder):
+        os.makedirs(args.output_folder)
 
-    return ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors
+    args.n_cls = n_cls
 
-# creating prompts
-def PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors):
-    n_cls = len(classnames)
-    dtype = model.dtype
-    prompt_prefix = " ".join(["X"] * (M1 + M2))
+    print(args)
 
-    classnames = [name.replace("_", " ") for name in classnames]
-    prompts = [prompt_prefix + " " + name + "." for name in classnames]
-
-    tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(device)
-
-    embedding = model.token_embedding(tokenized_prompts).type(dtype)
-    prefix = embedding[:, :1, :]
-    suffix = embedding[:, 1 + M1 + M2:, :]
-
-    source_prompts = torch.cat(
-        [prefix,  # (n_cls, 1, dim)
-         ctx_cls_vectors,  # (n_cls, M1, dim)
-         ctx_source_vectors.repeat(n_cls, 1, 1),  # (n_cls, M2, dim)
-         suffix,  # (n_cls, *, dim)
-         ],
-        dim=1)
-    target_prompts = torch.cat(
-        [prefix,  # (n_cls, 1, dim)
-         ctx_cls_vectors,  # (n_cls, M1, dim)
-         ctx_target_vectors.repeat(n_cls, 1, 1),  # (n_cls, M2, dim)
-         suffix,  # (n_cls, *, dim)
-         ],
-        dim=1)
-    prompts = torch.cat([source_prompts, target_prompts], dim=0)
-    return prompts, tokenized_prompts
-
-#re-defining clip's textencoder
-class TextEncoder(nn.Module):
-    def __init__(self, clip_model):
-        super().__init__()
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
-        self.dtype = clip_model.dtype
-
-    def forward(self, prompts, tokenized_prompts):
-        x = prompts + self.positional_embedding.type(self.dtype)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
-
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        print(tokenized_prompts.argmax(dim=-1))
-        print(tokenized_prompts)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-        return x
-
-#custom clip for training learnable prompts
-class CustomCLIP(nn.Module):
-    def __init__(self, clip_model):
-        super().__init__()
-        self.image_encoder = clip_model.visual
-        self.text_encoder = TextEncoder(clip_model)
-        self.logit_scale = clip_model.logit_scale
-        self.dtype = clip_model.dtype
-
-    def forward(self, image, prompts, tokenized_prompts):
-        image_features = self.image_encoder(image.type(self.dtype))
-        tokenized_prompts = torch.cat([tokenized_prompts, tokenized_prompts], dim=0)
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-        logit_scale = self.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()
-        return logits.softmax(dim=-1)
+    train(domain_list, classnames, model, preprocess, args)
 
 
-def load_train(source_path, target_path, batch_size, preprocess):
-    source_data = datasets.ImageFolder(root=source_path, transform=preprocess)
-    target_data = datasets.ImageFolder(root=target_path, transform=preprocess)
-    source_loader = torch.utils.data.DataLoader(source_data, batch_size=batch_size, shuffle=True, drop_last=True)
-    target_loader = torch.utils.data.DataLoader(target_data, batch_size=batch_size, shuffle=True, drop_last=True)
-    return source_loader, target_loader
-
-
-def target_text(target_path):
-    target_classes = os.listdir(target_path)
-    for i in range(len(target_classes)):
-        target_classes[i] = 'A photo of a ' + target_classes[i]
-    return target_classes
-
-
-def train(source_path, target_path, batch_size, classnames, clip_model, custom_clip, preprocess):
-    ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors = ParamGenerator(clip_model, classnames, M1, M2)
-    optimizer = torch.optim.SGD([ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors], lr=0.003)
-    scheduler = CosineAnnealingLR(optimizer, T_max=iteration)
-
-    source_loader, target_loader = load_train(source_path, target_path, batch_size, preprocess)
-    source_iter = iter(source_loader)
-    target_iter = iter(target_loader)
-    text = target_text(target_path)
-    for i in range(iteration):
-        try:
-            source_data, source_label = source_iter.next()
-        except Exception as err:
-            source_iter = iter(source_loader)
-            source_data, source_label = source_iter.next()
-
-        try:
-            target_data, target_label = target_iter.next()
-        except Exception as err:
-            target_iter = iter(target_loader)
-            target_data, target_label = target_iter.next()
-
-        source_data = source_data.to(device)
-        source_label = source_label.to(device)
-        target_data = target_data.to(device)
-
-        prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors)
-
-        optimizer.zero_grad()
-        source_output = custom_clip(source_data, prompts, tokenized_prompts)
-        source_loss = F.cross_entropy(source_output, source_label)
-
-        target_token = clip.tokenize(text).to(device)
-        logits_per_image, logits_per_text = clip_model(target_data, target_token)
-        pseudo_label = torch.argmax(logits_per_image.softmax(dim=-1), dim=1)  # target class pseudo labels
-        pseudo_label += 65
-        target_output = custom_clip(target_data, prompts, tokenized_prompts)
-        target_loss = F.cross_entropy(target_output, pseudo_label)
-
-        loss = source_loss + target_loss
-        loss.backward()
-        optimizer.step()
-
-        if i % 50 == 0:
-            scheduler.step()
-            print("loss is " + str(loss))
-
-    return ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors
-
-
-def test(prompts, target_path, preprocess):
-    _, target_loader = load_train(source_path, target_path, 32, preprocess)
-    tot_acc = 0
-
-    with torch.no_grad():
-        for target_data, target_label in target_loader:
-            target_data = target_data.to(device)
-            target_label = target_label.to(device)
-
-            target_label += 65
-            output = custom_clip(target_data, prompts, tokenized_prompts)
-            tot_acc += (output.argmax(1) == target_label).sum().item()
-    print("accuracy is " + str(tot_acc / 1989))
 
 if __name__ == '__main__':
-    model, preprocess = clip.load("RN101", device=device)
-    # convert_models_to_fp32(model)
-    # model.eval()
+    parser = argparse.ArgumentParser('Training and Evaluation Script', parents=[arg_parse()])
+    args = parser.parse_args()
 
-    source_name = 'Art'
-    target_name = 'Clipart'
-
-    source_root_path = r'/share/test/hrchen/OfficeHomeDataset/'
-    target_root_path = r'/share/test/hrchen/OfficeHomeDataset/'
-
-    source_path = source_root_path + source_name
-    target_path = target_root_path + target_name
-
-    classnames = os.listdir(source_path)
-
-    custom_clip = CustomCLIP(model)
-    ctx_cls_vectors, ctx_source_vectors, ctx_target_vectors = train(source_path, target_path, 16, classnames, model,
-                                                                    custom_clip, preprocess)
-    prompts, tokenized_prompts = PromptGenerator(classnames, M1, M2, ctx_cls_vectors, ctx_source_vectors,
-                                                 ctx_target_vectors)
-    test(prompts, target_path, preprocess)
-
-
-
-
+    main(args)
