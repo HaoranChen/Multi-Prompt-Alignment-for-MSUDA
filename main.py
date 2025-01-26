@@ -55,6 +55,7 @@ def arg_parse():
     parser.add_argument('--msf_alpha', type=int, default=500, help='')
     parser.add_argument('--output_folder', type=str, default='', help='')
     parser.add_argument('--n_cls', type=int, default=0, help='number of classes in dataset')
+    parser.add_argument('--AE_domain', type=bool, default=False, help='number of classes in dataset')
 
 
     return parser
