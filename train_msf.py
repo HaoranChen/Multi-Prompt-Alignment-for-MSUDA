@@ -83,8 +83,12 @@ def train_MSF(target_name, target_train_loader, target_test_loader, cls_list, do
 
             target_prompt = torch.cat([target_domain.repeat(args.n_cls, 1, 1), target_cls], dim=1)
             target_new_cls = AE_cls(target_cls)
-            target_new_domain = AE_domain(target_domain)
-            target_new_prompt = torch.cat([target_domain.repeat(args.n_cls, 1, 1), target_new_cls], dim=1)
+
+            if args.AE_domain:
+                target_new_domain = AE_domain(target_domain)
+                target_new_prompt = torch.cat([target_new_domain.repeat(args.n_cls, 1, 1), target_new_cls], dim=1)
+            else:
+                target_new_prompt = torch.cat([target_domain.repeat(args.n_cls, 1, 1), target_new_cls], dim=1)
 
             AE_loss += torch.pow(torch.linalg.norm(target_new_prompt - target_prompt) / 12, 2)
             target_new_prompt, tokenized_prompts = Prompt(classnames, clip_model, target_new_prompt, args)
